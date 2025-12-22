@@ -97,6 +97,16 @@ def _safe_filename(name: str) -> str:
     return "".join(keep)[:180]
 
 
+def _format_setting_value(value):
+    """Format a setting value for the API."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    elif isinstance(value, (list, dict)):
+        return json.dumps(value)
+    else:
+        return str(value)
+
+
 # ============================================================================
 # DEVICE MANAGEMENT TOOLS
 # ============================================================================
@@ -1503,6 +1513,241 @@ def unacknowledge_incident(incident_id: str) -> dict:
 
 
 # ============================================================================
+# DEVICE SETTINGS MANAGEMENT TOOLS (ENHANCED)
+# ============================================================================
+
+@mcp.tool()
+def get_device_settings(device_id: str = None, device_name: str = None) -> dict:
+    """
+    Retrieve all configuration settings for a specific Canary device.
+    
+    Args:
+        device_id: The node_id of the device
+        device_name: The name of the device (alternative to device_id)
+    
+    Returns:
+        dict: Complete settings object for the device
+    """
+    if not device_id and not device_name:
+        raise RuntimeError("Must specify either device_id or device_name")
+    
+    # If only name provided, look up the ID
+    if not device_id:
+        devices_result = list_devices()
+        for device in devices_result["devices"]:
+            if device["name"] and device_name.lower() in device["name"].lower():
+                device_id = device["id"]
+                break
+        
+        if not device_id:
+            raise RuntimeError("Device '" + device_name + "' not found")
+    
+    _log("=" * 60)
+    _log("GETTING DEVICE SETTINGS FOR: " + device_id)
+    _log("=" * 60)
+    
+    result = _get_json("/api/v1/device/info", {
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "settings": "true"
+    })
+    
+    if result.get("result") != "success":
+        raise RuntimeError("Get device settings failed: " + (result.get("message") or json.dumps(result)))
+    
+    device = result.get("device", {})
+    settings = device.get("settings", {})
+    
+    _log("Retrieved settings with " + str(len(settings)) + " keys")
+    _log("=" * 60)
+    
+    return {
+        "device_id": device_id,
+        "device_name": device.get("name"),
+        "settings": settings,
+        "update_tag": device.get("update_tag")
+    }
+
+
+@mcp.tool()
+def update_device_settings(device_id: str, settings: dict) -> dict:
+    """
+    Update configuration settings for a specific Canary device.
+    
+    Use get_device_settings first to retrieve the current settings object, modify it as needed, then submit the updated object.
+    
+    Common settings to modify:
+        device.name - Device name (e.g., 'SecOps-04')
+        device.desc - Device description
+        device.personality - Device personality (windows, linux, network, osx-fileshare, bare, etc)
+        device.ip_address - IP address
+        device.netmask - Network mask
+        device.gw - Gateway
+        device.dns1 / device.dns2 - DNS servers
+        smb.enabled - Enable/disable SMB service
+        ssh.instances[0].enabled - Enable/disable SSH
+        http.instances[0].enabled - Enable/disable HTTP
+        And many more service-specific settings
+    
+    Args:
+        device_id: The node_id of the device to update
+        settings: The modified settings object (dict)
+    
+    Returns:
+        dict: Update result confirmation
+    """
+    _log("=" * 60)
+    _log("UPDATING DEVICE SETTINGS FOR: " + device_id)
+    _log("=" * 60)
+    
+    # First get the current device info to obtain update_tag
+    _log("Fetching current device info to get update_tag...")
+    device_info_result = _get_json("/api/v1/device/info", {
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "settings": "true"
+    })
+    
+    if device_info_result.get("result") != "success":
+        raise RuntimeError("Failed to get device info: " + (device_info_result.get("message") or json.dumps(device_info_result)))
+    
+    device = device_info_result.get("device", {})
+    update_tag = device.get("update_tag")
+    
+    if not update_tag:
+        raise RuntimeError("Could not retrieve update_tag from device info")
+    
+    _log("Got update_tag: " + update_tag)
+    
+    # Build the payload with all settings
+    payload = {
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "update_tag": update_tag
+    }
+    
+    # Flatten settings dict into form data (device.name=value format)
+    _log("Flattening " + str(len(settings)) + " settings into payload...")
+    
+    def flatten_dict(d, parent_key=''):
+        items = []
+        for k, v in d.items():
+            new_key = parent_key + '.' + k if parent_key else k
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, new_key).items())
+            elif isinstance(v, list):
+                # Handle lists - convert to JSON string
+                items.append((new_key, json.dumps(v)))
+            else:
+                items.append((new_key, _format_setting_value(v)))
+        return dict(items)
+    
+    flattened_settings = flatten_dict(settings)
+    payload.update(flattened_settings)
+    
+    _log("Payload has " + str(len(payload)) + " keys total")
+    
+    # Submit updated settings
+    result = _post_form("/api/v1/device/update", payload)
+    
+    if result.get("result") != "success":
+        error_msg = result.get("message") or json.dumps(result)
+        _log("ERROR: Settings update failed: " + error_msg)
+        raise RuntimeError("Settings update failed: " + error_msg)
+    
+    _log("Device settings updated successfully!")
+    _log("=" * 60)
+    
+    return {
+        "device_id": device_id,
+        "status": "success",
+        "settings_updated": len(flattened_settings),
+        "raw_response": result
+    }
+
+
+@mcp.tool()
+def update_device_setting(device_id: str, setting_key: str, value) -> dict:
+    """
+    Convenience function to update a single device setting without needing to provide the full settings object.
+    
+    This function sends the setting directly to the API using dot notation, which allows you to change any 
+    device configuration property according to the Canary API documentation.
+    
+    Common examples:
+        - Update name: update_device_setting(device_id, 'device.name', 'SecOps-04')
+        - Update description: update_device_setting(device_id, 'device.desc', 'Production Honeypot')
+        - Enable SSH: update_device_setting(device_id, 'ssh.instances.0.enabled', True)
+        - Disable SMB: update_device_setting(device_id, 'smb.enabled', False)
+        - Update IP: update_device_setting(device_id, 'device.ip_address', '192.168.1.100')
+        - Set HTTP banner: update_device_setting(device_id, 'http.instances.0.banner', 'Apache/2.4.41')
+        - Enable FTP: update_device_setting(device_id, 'ftp.enabled', True)
+        - Set device location: update_device_setting(device_id, 'device.location', 'Server Room A')
+    
+    Args:
+        device_id: The node_id of the device
+        setting_key: Dot-notation path to the setting (e.g., 'device.name' or 'ssh.instances.0.enabled')
+        value: The new value (string, int, bool, list, or dict)
+    
+    Returns:
+        dict: Update result confirmation
+    """
+    _log("=" * 60)
+    _log("UPDATING SINGLE DEVICE SETTING")
+    _log("Device ID: " + device_id)
+    _log("Setting: " + setting_key)
+    _log("Value: " + str(value))
+    _log("=" * 60)
+    
+    # Get update_tag from current device info
+    _log("Fetching current device info to get update_tag...")
+    device_info_result = _get_json("/api/v1/device/info", {
+        "auth_token": _auth_token(),
+        "node_id": device_id
+    })
+    
+    if device_info_result.get("result") != "success":
+        raise RuntimeError("Failed to get device info: " + (device_info_result.get("message") or json.dumps(device_info_result)))
+    
+    device = device_info_result.get("device", {})
+    update_tag = device.get("update_tag")
+    
+    if not update_tag:
+        raise RuntimeError("Could not retrieve update_tag from device info")
+    
+    _log("Got update_tag: " + update_tag)
+    
+    # Build payload with the single setting
+    payload = {
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "update_tag": update_tag,
+        setting_key: _format_setting_value(value)
+    }
+    
+    _log("Sending update with setting: " + setting_key + " = " + str(payload[setting_key]))
+    
+    # Submit update
+    result = _post_form("/api/v1/device/update", payload)
+    
+    if result.get("result") != "success":
+        error_msg = result.get("message") or json.dumps(result)
+        _log("ERROR: Setting update failed: " + error_msg)
+        raise RuntimeError("Setting update failed: " + error_msg)
+    
+    _log("Device setting updated successfully!")
+    _log("=" * 60)
+    
+    return {
+        "device_id": device_id,
+        "setting_key": setting_key,
+        "value": value,
+        "status": "success",
+        "raw_response": result
+    }
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -1512,7 +1757,7 @@ def main() -> None:
     IMPORTANT: Don't print to stdout - it will corrupt JSON-RPC. Use stderr for logs.
     """
     _log("=" * 60)
-    _log("Starting Canary Console MCP Server (FULL VERSION)")
+    _log("Starting Canary Console MCP Server (ENHANCED VERSION)")
     _log("=" * 60)
     _log("Environment check:")
     
@@ -1542,6 +1787,9 @@ def main() -> None:
     _log("    - update_device_description() - Update device description")
     _log("    - configure_device_from_prompt() - Natural language configuration")
     _log("    - reboot_device() - Reboot a device")
+    _log("    - get_device_settings() - Get all device configuration settings")
+    _log("    - update_device_settings() - Update full device settings object")
+    _log("    - update_device_setting() - Update a single device setting (ENHANCED)")
     _log("  FLOCKS:")
     _log("    - list_flocks() - List all flocks (device groups)")
     _log("  TOKENS:")
@@ -1569,6 +1817,9 @@ def main() -> None:
     _log("    - get_incident_details() - Get detailed incident information")
     _log("    - acknowledge_incident() - Acknowledge an incident")
     _log("    - unacknowledge_incident() - Unacknowledge an incident")
+    _log("=" * 60)
+    _log("ENHANCED: update_device_setting() now supports ANY device configuration property")
+    _log("          according to Canary API documentation using dot notation")
     _log("=" * 60)
     _log("Server ready for connections")
     _log("=" * 60)
