@@ -1308,6 +1308,7 @@ def download_factory_tokens(
     _log("=" * 60)
     
     b = _get_bytes("/api/v1/canarytoken/factory/download", {
+        "auth_token": _auth_token(),
         "factory_auth": factory_auth
     })
     
