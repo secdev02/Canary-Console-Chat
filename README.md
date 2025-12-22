@@ -103,7 +103,7 @@ python .\canary_mcp_server.py
 [2025-12-22 08:01:15] ============================================================
 ```
 
-Step Four: Launch Claude Desktop and Interact with your Console 
+## Step Four: Launch Claude Desktop and Interact with your Console 
 
 Sample Prompt
 
@@ -112,6 +112,8 @@ List Canaries in my default flock
 List available Microsoft Personalities and services 
 Then configure the Canary with the latest IIS Personality
 ```
+
+
 
 Experiment and see where we can improve the MCP or the API or both.
 
