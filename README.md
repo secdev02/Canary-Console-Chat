@@ -5,7 +5,7 @@ Connect your Canary Console to Claude via MCP - Natural Language API interaction
 The following MCP allows Thinkst Canary Customers to use model interaction to 
 
 ```
-1. Create Canaryttokens
+1. Create Canarytokens
 2. Configure Canary Personalities
 3. Manage Console Flock and Canarytoken and Canary properties
 ```
