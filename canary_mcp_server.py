@@ -5,577 +5,411 @@ import pathlib
 import requests
 import re
 from datetime import datetime
+from typing import Optional, Dict, Any
 
 from mcp.server.fastmcp import FastMCP
 
-# MCP server (stdio)
 mcp = FastMCP("canary-console-mcp", json_response=True)
-
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
 def _log(message: str) -> None:
-    """Log to stderr (stdout is reserved for JSON-RPC in stdio mode)"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print("[" + timestamp + "] " + message, file=sys.stderr)
-
+    """Log to stderr (stdout is reserved for JSON-RPC)"""
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}", file=sys.stderr)
 
 def _must_env(name: str) -> str:
+    """Get required environment variable or raise error"""
     v = os.environ.get(name, "").strip()
     if not v:
-        raise RuntimeError("Missing required env var: " + name)
+        raise RuntimeError(f"Missing required env var: {name}")
     return v
 
-
 def _base_url() -> str:
+    """Get base URL from environment"""
     domain = _must_env("CANARY_DOMAIN")
-    url = "https://" + domain
-    _log("Using Canary Console: " + url)
+    url = f"https://{domain}"
+    _log(f"Using Canary Console: {url}")
     return url
 
-
 def _auth_token() -> str:
+    """Get auth token from environment"""
     token = _must_env("CANARY_AUTH_TOKEN")
-    _log("Auth token loaded (length: " + str(len(token)) + ")")
+    _log(f"Auth token loaded (length: {len(token)})")
     return token
 
-
-def _post_form(path: str, data: dict) -> dict:
+def _api_call(method: str, path: str, data: Optional[Dict] = None, params: Optional[Dict] = None) -> Dict:
+    """Generic API call handler"""
     url = _base_url() + path
-    _log("POST " + url + " with data keys: " + str(list(data.keys())))
-    resp = requests.post(url, data=data, timeout=30)
-    _log("Response status: " + str(resp.status_code))
+    _log(f"{method} {url}")
+    
+    kwargs = {"timeout": 60 if "download" in path else 30}
+    if method == "POST":
+        kwargs["data"] = data or {}
+        resp = requests.post(url, **kwargs)
+    else:
+        kwargs["params"] = params or {}
+        resp = requests.get(url, **kwargs)
+    
+    _log(f"Response status: {resp.status_code}")
     
     try:
         result = resp.json()
-        _log("Response result: " + result.get("result", "unknown"))
+        _log(f"Response result: {result.get('result', 'unknown')}")
         return result
     except Exception as e:
-        _log("ERROR: Non-JSON response: " + str(e))
-        raise RuntimeError("Non-JSON response from " + url + ": HTTP " + str(resp.status_code) + " " + resp.text[:500])
+        _log(f"ERROR: Non-JSON response: {e}")
+        raise RuntimeError(f"Non-JSON response from {url}: HTTP {resp.status_code} {resp.text[:500]}")
 
-
-def _get_json(path: str, params: dict) -> dict:
-    """GET request that returns JSON"""
+def _get_bytes(path: str, params: Dict) -> bytes:
+    """Download binary content"""
     url = _base_url() + path
-    _log("GET " + url + " with params: " + str(list(params.keys())))
-    resp = requests.get(url, params=params, timeout=30)
-    _log("Response status: " + str(resp.status_code))
-    
-    try:
-        result = resp.json()
-        _log("Response result: " + result.get("result", "unknown"))
-        return result
-    except Exception as e:
-        _log("ERROR: Non-JSON response: " + str(e))
-        raise RuntimeError("Non-JSON response from " + url + ": HTTP " + str(resp.status_code) + " " + resp.text[:500])
-
-
-def _get_bytes(path: str, params: dict) -> bytes:
-    url = _base_url() + path
-    _log("GET " + url + " with params: " + str(params.keys()))
+    _log(f"GET {url} (binary)")
     resp = requests.get(url, params=params, allow_redirects=True, timeout=60)
     
     if not resp.ok:
-        _log("ERROR: Download failed with status " + str(resp.status_code))
-        raise RuntimeError("Download failed: HTTP " + str(resp.status_code) + " " + resp.text[:500])
+        raise RuntimeError(f"Download failed: HTTP {resp.status_code} {resp.text[:500]}")
     
-    _log("Downloaded " + str(len(resp.content)) + " bytes")
+    _log(f"Downloaded {len(resp.content)} bytes")
     return resp.content
 
-
 def _safe_filename(name: str) -> str:
-    """Conservative filename sanitizer"""
-    keep = []
-    for ch in name:
-        if ch.isalnum() or ch in " ._-()+[]":
-            keep.append(ch)
-        else:
-            keep.append("_")
-    return "".join(keep)[:180]
+    """Sanitize filename"""
+    return "".join(ch if ch.isalnum() or ch in " ._-()+[]" else "_" for ch in name)[:180]
 
-
-def _format_setting_value(value):
-    """Format a setting value for the API."""
+def _format_value(value: Any) -> str:
+    """Format value for API"""
     if isinstance(value, bool):
         return "true" if value else "false"
     elif isinstance(value, (list, dict)):
         return json.dumps(value)
-    else:
-        return str(value)
+    return str(value)
 
-
-# ============================================================================
-# DEVICE MANAGEMENT TOOLS
-# ============================================================================
-
-@mcp.tool()
-def list_devices() -> dict:
-    """
-    List all Canary devices in the console.
-    Returns device information including names, IDs, personalities, and IP addresses.
-    """
-    _log("=" * 60)
-    _log("LISTING ALL DEVICES")
-    _log("=" * 60)
-    
-    result = _get_json("/api/v1/devices/all", {
-        "auth_token": _auth_token()
-    })
-    
-    if result.get("result") != "success":
-        raise RuntimeError("List devices failed: " + (result.get("message") or json.dumps(result)))
-    
-    devices = result.get("devices", [])
-    _log("Found " + str(len(devices)) + " devices")
-    
-    device_list = []
-    for device in devices:
-        device_info = {
-            "id": device.get("id"),
-            "name": device.get("name"),
-            "description": device.get("description"),
-            "personality": device.get("personality"),
-            "ip_address": device.get("ip_address"),
-            "live": device.get("live"),
-            "mac_address": device.get("mac"),
-            "uptime": device.get("uptime")
-        }
-        device_list.append(device_info)
-        _log("  Device: " + str(device_info["name"]) + " (ID: " + str(device_info["id"]) + ", Personality: " + str(device_info["personality"]) + ")")
-    
-    return {
-        "count": len(device_list),
-        "devices": device_list
-    }
-
-
-@mcp.tool()
-def get_device_info(device_id: str = None, device_name: str = None) -> dict:
-    """
-    Get detailed information for a specific Canary device.
-    Specify either device_id or device_name.
-    """
-    if not device_id and not device_name:
+def _find_device(device_id: Optional[str] = None, device_name: Optional[str] = None) -> str:
+    """Find device ID by name or return provided ID"""
+    if device_id:
+        return device_id
+    if not device_name:
         raise RuntimeError("Must specify either device_id or device_name")
     
-    # If only name provided, look up the ID
-    if not device_id:
-        devices_result = list_devices()
-        for device in devices_result["devices"]:
-            if device["name"] and device_name.lower() in device["name"].lower():
-                device_id = device["id"]
-                break
-        
-        if not device_id:
-            raise RuntimeError("Device '" + device_name + "' not found")
+    devices = list_devices()["devices"]
+    for device in devices:
+        if device["name"] and device_name.lower() in device["name"].lower():
+            return device["id"]
     
-    _log("Getting info for device: " + device_id)
+    raise RuntimeError(f"Device '{device_name}' not found")
+
+def _get_update_tag(device_id: str) -> str:
+    """Get update_tag for device"""
+    result = _api_call("GET", "/api/v1/device/info", params={
+        "auth_token": _auth_token(),
+        "node_id": device_id
+    })
+    if result.get("result") != "success":
+        raise RuntimeError(f"Failed to get device info: {result.get('message')}")
+    return result["device"]["update_tag"]
+
+def _flatten_dict(d: Dict, parent_key: str = '') -> Dict:
+    """Flatten nested dict to dot notation"""
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}.{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, new_key).items())
+        elif isinstance(v, list):
+            items.append((new_key, json.dumps(v)))
+        else:
+            items.append((new_key, _format_value(v)))
+    return dict(items)
+
+# ============================================================================
+# DEVICE MANAGEMENT
+# ============================================================================
+
+@mcp.tool()
+def list_devices() -> Dict:
+    """List all Canary devices"""
+    _log("=" * 60)
+    _log("LISTING ALL DEVICES")
     
-    result = _get_json("/api/v1/device/info", {
+    result = _api_call("GET", "/api/v1/devices/all", params={"auth_token": _auth_token()})
+    if result.get("result") != "success":
+        raise RuntimeError(f"List devices failed: {result.get('message', result)}")
+    
+    devices = result.get("devices", [])
+    _log(f"Found {len(devices)} devices")
+    
+    device_list = [{
+        "id": d.get("id"),
+        "name": d.get("name"),
+        "description": d.get("description"),
+        "personality": d.get("personality"),
+        "ip_address": d.get("ip_address"),
+        "live": d.get("live"),
+        "mac_address": d.get("mac"),
+        "uptime": d.get("uptime")
+    } for d in devices]
+    
+    return {"count": len(device_list), "devices": device_list}
+
+@mcp.tool()
+def get_device_info(device_id: Optional[str] = None, device_name: Optional[str] = None) -> Dict:
+    """Get detailed device information"""
+    device_id = _find_device(device_id, device_name)
+    _log(f"Getting info for device: {device_id}")
+    
+    result = _api_call("GET", "/api/v1/device/info", params={
         "auth_token": _auth_token(),
         "node_id": device_id
     })
     
     if result.get("result") != "success":
-        raise RuntimeError("Get device info failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Get device info failed: {result.get('message', result)}")
     
-    device = result.get("device", {})
-    
-    return {
-        "device_id": device_id,
-        "device": device,
-        "raw_response": result
-    }
-
+    return {"device_id": device_id, "device": result.get("device", {}), "raw_response": result}
 
 @mcp.tool()
-def configure_device_personality(device_id: str, personality: str) -> dict:
+def configure_device_personality(device_id: str, personality: str) -> Dict:
     """
-    Configure a Canary device's personality.
-    
-    Uses the correct API endpoint: /api/v1/device/configure_personality
-    Docs: https://docs.canary.tools/bird-management/service-configuration.html
-    
-    Args:
-        device_id: The node_id of the device to configure
-        personality: The personality to set - options:
-            - 'windows' - Windows server
-            - 'linux' - Linux server
-            - 'osx-fileshare' - Mac file share
-            - 'network' - Network device (router/switch)
-    
-    Returns:
-        dict: Configuration result
+    Configure device personality.
+    Options: windows, linux, osx-fileshare, network
     """
-    _log("=" * 60)
-    _log("CONFIGURE DEVICE PERSONALITY")
-    _log("Device ID: " + device_id)
-    _log("Personality: " + personality)
-    _log("=" * 60)
+    _log(f"Configure personality: {device_id} -> {personality}")
     
-    payload = {
+    result = _api_call("POST", "/api/v1/device/configure_personality", data={
         "auth_token": _auth_token(),
         "node_id": device_id,
         "personality": personality
-    }
-    
-    result = _post_form("/api/v1/device/configure_personality", payload)
-    
-    if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Configure personality failed: " + error_msg)
-        raise RuntimeError("Configure personality failed: " + error_msg)
-    
-    _log("Personality configured successfully!")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "personality": personality,
-        "status": "success",
-        "raw_response": result
-    }
-
-
-@mcp.tool()
-def update_device_description(device_id: str, description: str) -> dict:
-    """
-    Update a Canary device's description.
-    
-    Args:
-        device_id: The node_id of the device
-        description: New description text
-    
-    Returns:
-        dict: Update result
-    """
-    _log("=" * 60)
-    _log("UPDATE DEVICE DESCRIPTION")
-    _log("Device ID: " + device_id)
-    _log("Description: " + description)
-    _log("=" * 60)
-    
-    # Get current device info to obtain update_tag
-    _log("Fetching current device info to get update_tag...")
-    device_info_result = _get_json("/api/v1/device/info", {
-        "auth_token": _auth_token(),
-        "node_id": device_id
     })
     
-    if device_info_result.get("result") != "success":
-        raise RuntimeError("Failed to get device info: " + (device_info_result.get("message") or json.dumps(device_info_result)))
+    if result.get("result") != "success":
+        raise RuntimeError(f"Configure personality failed: {result.get('message', result)}")
     
-    device = device_info_result.get("device", {})
-    update_tag = device.get("update_tag")
+    _log("Personality configured successfully!")
+    return {"device_id": device_id, "personality": personality, "status": "success", "raw_response": result}
+
+@mcp.tool()
+def update_device_description(device_id: str, description: str) -> Dict:
+    """Update device description"""
+    _log(f"Update description: {device_id}")
     
-    if not update_tag:
-        raise RuntimeError("Could not retrieve update_tag from device info")
-    
-    _log("Got update_tag: " + update_tag)
-    
-    # Update description
-    payload = {
+    update_tag = _get_update_tag(device_id)
+    result = _api_call("POST", "/api/v1/device/update", data={
         "auth_token": _auth_token(),
         "node_id": device_id,
         "update_tag": update_tag,
         "device.desc": description
-    }
-    
-    result = _post_form("/api/v1/device/update", payload)
+    })
     
     if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Description update failed: " + error_msg)
-        raise RuntimeError("Description update failed: " + error_msg)
+        raise RuntimeError(f"Description update failed: {result.get('message', result)}")
     
     _log("Description updated successfully!")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "description": description,
-        "status": "success",
-        "raw_response": result
-    }
-
+    return {"device_id": device_id, "description": description, "status": "success", "raw_response": result}
 
 @mcp.tool()
-def reboot_device(device_id: str) -> dict:
-    """
-    Reboot a Canary device.
+def reboot_device(device_id: str) -> Dict:
+    """Reboot a Canary device"""
+    _log(f"Rebooting device: {device_id}")
     
-    Args:
-        device_id: The node_id of the device to reboot
-    
-    Returns:
-        dict: Reboot result
-    """
-    _log("=" * 60)
-    _log("REBOOTING DEVICE: " + device_id)
-    _log("=" * 60)
-    
-    result = _post_form("/api/v1/device/reboot", {
+    result = _api_call("POST", "/api/v1/device/reboot", data={
         "auth_token": _auth_token(),
         "node_id": device_id
     })
     
     if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Reboot failed: " + error_msg)
-        raise RuntimeError("Reboot failed: " + error_msg)
+        raise RuntimeError(f"Reboot failed: {result.get('message', result)}")
     
-    _log("Device reboot initiated successfully!")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "status": "rebooting",
-        "raw_response": result
-    }
-
-
-def _infer_device_personality(prompt: str) -> str:
-    """Infer the device personality from a natural language prompt."""
-    prompt_lower = prompt.lower()
-    
-    if any(word in prompt_lower for word in ["windows", "win", "smb", "file server", "fileshare", "cifs"]):
-        return "windows"
-    elif any(word in prompt_lower for word in ["mac", "osx", "apple", "macos"]):
-        return "osx-fileshare"
-    elif any(word in prompt_lower for word in ["linux", "unix", "ssh"]):
-        return "linux"
-    elif any(word in prompt_lower for word in ["network", "cisco", "router", "switch"]):
-        return "network"
-    else:
-        _log("No specific personality detected, defaulting to windows")
-        return "windows"
-
-
-def _extract_device_name(prompt: str) -> str:
-    """Extract device name from prompt."""
-    # Pattern: "my CanaryXX" or "Canary XX"
-    match = re.search(r'\bmy\s+(\S+)', prompt, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Try "device named/called XX"
-    match = re.search(r'\b(?:device|canary|bird)\s+(?:named|called)\s+(\S+)', prompt, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    # Try just "CanaryXX" pattern
-    match = re.search(r'\b(Canary\w+)', prompt, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    
-    return None
-
+    _log("Device reboot initiated!")
+    return {"device_id": device_id, "status": "rebooting", "raw_response": result}
 
 @mcp.tool()
-def configure_device_from_prompt(prompt: str) -> dict:
+def configure_device_from_prompt(prompt: str) -> Dict:
     """
-    Configure a Canary device based on a natural language prompt.
-    
-    Examples:
-    - "Configure my Canary01 as a Windows file server"
-    - "Set up device Canary-Lab as a Linux SSH server"
-    - "Make my Canary02 look like an OSX file share"
-    - "Update my CanaryTest to be a network device with description 'Test Router'"
-    
-    The function will:
-    1. Find the device by name
-    2. Infer the desired personality
-    3. Apply the configuration
-    4. Update description if specified
-    
-    Args:
-        prompt: Natural language description of desired configuration
-    
-    Returns:
-        dict: Configuration result
+    Configure a Canary device from natural language.
+    Example: "Configure my Canary01 as a Windows file server"
     """
-    _log("=" * 60)
-    _log("CONFIGURE DEVICE FROM PROMPT: " + prompt)
-    _log("=" * 60)
+    _log(f"Configure from prompt: {prompt}")
     
     # Extract device name
-    device_name = _extract_device_name(prompt)
-    if not device_name:
-        raise RuntimeError("Could not identify device name in prompt. Please specify like 'my Canary01' or 'device named XYZ'")
-    
-    _log("Target device: " + device_name)
-    
-    # Get list of devices to find the ID
-    devices_result = list_devices()
-    target_device = None
-    
-    for device in devices_result["devices"]:
-        if device["name"] and device_name.lower() in device["name"].lower():
-            target_device = device
-            break
-    
-    if not target_device:
-        available = [d["name"] for d in devices_result["devices"]]
-        raise RuntimeError("Device '" + device_name + "' not found. Available devices: " + str(available))
-    
-    _log("Found device ID: " + target_device["id"])
-    
-    # Infer personality from prompt
-    personality = _infer_device_personality(prompt)
-    _log("Inferred personality: " + personality)
-    
-    # Configure the personality using the CORRECT endpoint
-    result = configure_device_personality(target_device["id"], personality)
-    
-    # Extract description if specified
-    description = None
-    desc_patterns = [
-        r'description\s+["\']([^"\']+)["\']',
-        r'(?:set|with)\s+description\s+["\']([^"\']+)["\']'
+    patterns = [
+        r'\bmy\s+(\S+)',
+        r'\b(?:device|canary|bird)\s+(?:named|called)\s+(\S+)',
+        r'\b(Canary\w+)'
     ]
-    
-    for pattern in desc_patterns:
+    device_name = None
+    for pattern in patterns:
         match = re.search(pattern, prompt, re.IGNORECASE)
         if match:
-            description = match.group(1)
-            _log("Extracted description: " + description)
+            device_name = match.group(1)
             break
     
-    # Update description if specified
-    if description:
-        desc_result = update_device_description(target_device["id"], description)
+    if not device_name:
+        raise RuntimeError("Could not identify device name in prompt")
+    
+    device_id = _find_device(device_name=device_name)
+    _log(f"Found device ID: {device_id}")
+    
+    # Infer personality
+    prompt_lower = prompt.lower()
+    personality_map = {
+        "windows": ["windows", "win", "smb", "file server", "fileshare", "cifs"],
+        "osx-fileshare": ["mac", "osx", "apple", "macos"],
+        "linux": ["linux", "unix", "ssh"],
+        "network": ["network", "cisco", "router", "switch"]
+    }
+    
+    personality = "windows"  # default
+    for p, keywords in personality_map.items():
+        if any(word in prompt_lower for word in keywords):
+            personality = p
+            break
+    
+    _log(f"Inferred personality: {personality}")
+    result = configure_device_personality(device_id, personality)
+    
+    # Extract and update description if specified
+    desc_match = re.search(r'description\s+["\']([^"\']+)["\']', prompt, re.IGNORECASE)
+    if desc_match:
+        description = desc_match.group(1)
+        update_device_description(device_id, description)
         result["description_updated"] = True
         result["description"] = description
     
-    _log("=" * 60)
     return result
 
-
-# ============================================================================
-# FLOCK MANAGEMENT TOOLS
-# ============================================================================
-
 @mcp.tool()
-def list_flocks() -> dict:
-    """
-    List all Flocks (device groupings) in the console.
-    Returns flock information including names, IDs, and notes.
-    """
-    _log("=" * 60)
-    _log("LISTING ALL FLOCKS")
-    _log("=" * 60)
+def get_device_settings(device_id: Optional[str] = None, device_name: Optional[str] = None) -> Dict:
+    """Get all device configuration settings"""
+    device_id = _find_device(device_id, device_name)
+    _log(f"Getting settings for: {device_id}")
     
-    result = _get_json("/api/v1/flocks/list", {
-        "auth_token": _auth_token()
+    result = _api_call("GET", "/api/v1/device/info", params={
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "settings": "true"
     })
     
     if result.get("result") != "success":
-        raise RuntimeError("List flocks failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Get settings failed: {result.get('message', result)}")
     
-    flocks = result.get("flocks", [])
-    _log("Found " + str(len(flocks)) + " flocks")
-    
-    flock_list = []
-    for flock in flocks:
-        flock_info = {
-            "id": flock.get("id"),
-            "name": flock.get("name"),
-            "note": flock.get("note"),
-            "device_count": len(flock.get("devices", []))
-        }
-        flock_list.append(flock_info)
-        _log("  Flock: " + str(flock_info["name"]) + " (ID: " + str(flock_info["id"]) + ", Devices: " + str(flock_info["device_count"]) + ")")
-    
+    device = result.get("device", {})
     return {
-        "count": len(flock_list),
-        "flocks": flock_list
+        "device_id": device_id,
+        "device_name": device.get("name"),
+        "settings": device.get("settings", {}),
+        "update_tag": device.get("update_tag")
     }
-
-
-# ============================================================================
-# CANARYTOKEN MANAGEMENT TOOLS
-# ============================================================================
 
 @mcp.tool()
-def list_canarytokens(flock_id: str = None) -> dict:
-    """
-    List all Canarytokens in the console.
-    Returns detailed information about each token including type, memo, status, and trigger count.
+def update_device_settings(device_id: str, settings: Dict) -> Dict:
+    """Update full device settings object"""
+    _log(f"Updating settings for: {device_id}")
     
-    Args:
-        flock_id: Optional flock ID to filter results
-    
-    Returns:
-        dict: List of tokens with summary statistics
-    """
-    _log("=" * 60)
-    _log("LISTING ALL CANARYTOKENS")
-    _log("=" * 60)
-    
-    params = {
-        "auth_token": _auth_token()
+    update_tag = _get_update_tag(device_id)
+    payload = {
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "update_tag": update_tag
     }
+    payload.update(_flatten_dict(settings))
     
-    if flock_id:
-        params["flock_id"] = flock_id
-        _log("Filtering by flock_id: " + flock_id)
+    result = _api_call("POST", "/api/v1/device/update", data=payload)
+    if result.get("result") != "success":
+        raise RuntimeError(f"Settings update failed: {result.get('message', result)}")
     
-    result = _get_json("/api/v1/canarytokens/fetch", params)
+    _log("Settings updated successfully!")
+    return {"device_id": device_id, "status": "success", "settings_updated": len(settings), "raw_response": result}
+
+@mcp.tool()
+def update_device_setting(device_id: str, setting_key: str, value: Any) -> Dict:
+    """
+    Update single device setting using dot notation.
+    Examples: 'device.name', 'ssh.instances.0.enabled', 'smb.enabled'
+    """
+    _log(f"Update setting: {device_id} -> {setting_key} = {value}")
+    
+    update_tag = _get_update_tag(device_id)
+    result = _api_call("POST", "/api/v1/device/update", data={
+        "auth_token": _auth_token(),
+        "node_id": device_id,
+        "update_tag": update_tag,
+        setting_key: _format_value(value)
+    })
     
     if result.get("result") != "success":
-        raise RuntimeError("List canarytokens failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Setting update failed: {result.get('message', result)}")
     
-    tokens = result.get("tokens", [])
-    _log("Found " + str(len(tokens)) + " canarytokens")
-    
-    token_list = []
-    type_counts = {}
-    
-    for token in tokens:
-        token_info = {
-            "token_id": token.get("canarytoken"),
-            "kind": token.get("kind"),
-            "memo": token.get("memo"),
-            "enabled": token.get("enabled"),
-            "triggered_count": token.get("triggered_count", 0),
-            "created": token.get("created"),
-            "created_printable": token.get("created_printable"),
-            "url": token.get("url"),
-            "hostname": token.get("hostname")
-        }
-        token_list.append(token_info)
-        
-        # Count by type
-        kind = token.get("kind", "unknown")
-        type_counts[kind] = type_counts.get(kind, 0) + 1
-    
-    return {
-        "total_count": len(token_list),
-        "tokens": token_list,
-        "summary_by_type": type_counts
-    }
+    _log("Setting updated successfully!")
+    return {"device_id": device_id, "setting_key": setting_key, "value": value, "status": "success", "raw_response": result}
 
+# ============================================================================
+# FLOCK MANAGEMENT
+# ============================================================================
 
 @mcp.tool()
-def get_canarytokens_summary() -> dict:
-    """
-    Get a summary of Canarytokens grouped by type and count.
-    Useful for quick overview of token deployment.
-    """
-    _log("Getting canarytokens summary")
+def list_flocks() -> Dict:
+    """List all Flocks (device groupings)"""
+    _log("LISTING ALL FLOCKS")
     
-    # Get all tokens
+    result = _api_call("GET", "/api/v1/flocks/list", params={"auth_token": _auth_token()})
+    if result.get("result") != "success":
+        raise RuntimeError(f"List flocks failed: {result.get('message', result)}")
+    
+    flocks = result.get("flocks", [])
+    flock_list = [{
+        "id": f.get("id"),
+        "name": f.get("name"),
+        "note": f.get("note"),
+        "device_count": len(f.get("devices", []))
+    } for f in flocks]
+    
+    return {"count": len(flock_list), "flocks": flock_list}
+
+# ============================================================================
+# CANARYTOKEN MANAGEMENT
+# ============================================================================
+
+@mcp.tool()
+def list_canarytokens(flock_id: Optional[str] = None) -> Dict:
+    """List all Canarytokens"""
+    _log("LISTING ALL CANARYTOKENS")
+    
+    params = {"auth_token": _auth_token()}
+    if flock_id:
+        params["flock_id"] = flock_id
+    
+    result = _api_call("GET", "/api/v1/canarytokens/fetch", params=params)
+    if result.get("result") != "success":
+        raise RuntimeError(f"List tokens failed: {result.get('message', result)}")
+    
+    tokens = result.get("tokens", [])
+    type_counts = {}
+    
+    token_list = []
+    for t in tokens:
+        token_list.append({
+            "token_id": t.get("canarytoken"),
+            "kind": t.get("kind"),
+            "memo": t.get("memo"),
+            "enabled": t.get("enabled"),
+            "triggered_count": t.get("triggered_count", 0),
+            "created": t.get("created"),
+            "created_printable": t.get("created_printable"),
+            "url": t.get("url"),
+            "hostname": t.get("hostname")
+        })
+        kind = t.get("kind", "unknown")
+        type_counts[kind] = type_counts.get(kind, 0) + 1
+    
+    return {"total_count": len(token_list), "tokens": token_list, "summary_by_type": type_counts}
+
+@mcp.tool()
+def get_canarytokens_summary() -> Dict:
+    """Get summary of Canarytokens by type"""
     tokens_result = list_canarytokens()
     
-    summary = {
-        "total_tokens": tokens_result["total_count"],
-        "by_type": []
-    }
-    
-    # Create readable summary
     type_names = {
         "doc-msword": "Word Documents",
         "msexcel-macro": "Excel Spreadsheets",
@@ -588,474 +422,196 @@ def get_canarytokens_summary() -> dict:
         "clonedsite": "Cloned Sites"
     }
     
-    for kind, count in tokens_result["summary_by_type"].items():
-        readable_name = type_names.get(kind, kind)
-        summary["by_type"].append({
-            "type": kind,
-            "name": readable_name,
-            "count": count
-        })
+    by_type = [
+        {"type": kind, "name": type_names.get(kind, kind), "count": count}
+        for kind, count in tokens_result["summary_by_type"].items()
+    ]
+    by_type.sort(key=lambda x: x["count"], reverse=True)
     
-    # Sort by count descending
-    summary["by_type"].sort(key=lambda x: x["count"], reverse=True)
-    
-    return summary
+    return {"total_tokens": tokens_result["total_count"], "by_type": by_type}
 
-
-def _infer_token_kind(prompt: str) -> str:
-    """Infer the Canarytoken kind from a natural language prompt."""
-    prompt_lower = prompt.lower()
+@mcp.tool()
+def create_canarytoken(
+    kind: str,
+    memo: str,
+    flock_id: Optional[str] = None,
+    custom_domain: Optional[str] = None
+) -> Dict:
+    """
+    Create a Canarytoken.
+    Kinds: doc-msword, msexcel-macro, pdf-acrobat-reader, web, dns, smtp, aws-id, qr-code, clonedsite
+    """
+    _log(f"Creating {kind} token: {memo}")
     
-    if any(word in prompt_lower for word in ["word", "doc", "document", ".docx"]):
-        return "doc-msword"
-    elif any(word in prompt_lower for word in ["excel", "spreadsheet", ".xlsx", "xls"]):
-        return "msexcel-macro"
-    elif any(word in prompt_lower for word in ["pdf", ".pdf"]):
-        return "pdf-acrobat-reader"
-    elif any(word in prompt_lower for word in ["url", "web", "link", "http"]):
-        return "web"
-    elif any(word in prompt_lower for word in ["dns", "domain"]):
-        return "dns"
-    elif any(word in prompt_lower for word in ["email", "mail", "smtp"]):
-        return "smtp"
-    elif any(word in prompt_lower for word in ["aws", "amazon", "s3"]):
-        return "aws-id"
-    elif any(word in prompt_lower for word in ["qr", "qr code"]):
-        return "qr-code"
-    elif any(word in prompt_lower for word in ["cloned", "clone", "fake site"]):
-        return "clonedsite"
-    else:
-        # Default to Word doc as it's widely applicable
-        _log("No specific token type detected, defaulting to doc-msword")
-        return "doc-msword"
-
-
-def _extract_memo(prompt: str) -> str:
-    """Extract a reasonable memo from the prompt."""
-    # Look for quoted text
-    quoted = re.findall(r'["\'](.+?)["\']', prompt)
-    if quoted:
-        return quoted[0]
+    data = {
+        "auth_token": _auth_token(),
+        "kind": kind,
+        "memo": memo
+    }
+    if flock_id:
+        data["flock_id"] = flock_id
+    if custom_domain:
+        data["custom_domain"] = custom_domain
     
-    # Otherwise clean and truncate the prompt
-    memo = re.sub(r'\b(create|make|generate|build|token|canarytoken)\b', '', prompt, flags=re.IGNORECASE)
-    memo = memo.strip()
+    result = _api_call("POST", "/api/v1/canarytoken/create", data=data)
+    if result.get("result") != "success":
+        raise RuntimeError(f"Create failed: {result.get('message', result)}")
     
-    if len(memo) > 100:
-        memo = memo[:97] + "..."
+    token_obj = result.get("canarytoken", {})
+    token_id = token_obj.get("canarytoken")
+    if not token_id:
+        raise RuntimeError(f"No token_id in response: {result}")
     
-    return memo if memo else "Canarytoken created via MCP"
+    _log(f"Token created: {token_id}")
+    return {
+        "token_id": token_id,
+        "kind": token_obj.get("kind"),
+        "url": token_obj.get("url"),
+        "hostname": token_obj.get("hostname"),
+        "raw": result
+    }
 
+# Convenience functions for specific token types
+@mcp.tool()
+def create_word_token(memo: str, flock_id: Optional[str] = None, custom_domain: Optional[str] = None) -> Dict:
+    """Create Word document token"""
+    return create_canarytoken("doc-msword", memo, flock_id, custom_domain)
+
+@mcp.tool()
+def create_excel_token(memo: str, flock_id: Optional[str] = None, custom_domain: Optional[str] = None) -> Dict:
+    """Create Excel spreadsheet token"""
+    return create_canarytoken("msexcel-macro", memo, flock_id, custom_domain)
+
+@mcp.tool()
+def create_pdf_token(memo: str, flock_id: Optional[str] = None, custom_domain: Optional[str] = None) -> Dict:
+    """Create PDF document token"""
+    return create_canarytoken("pdf-acrobat-reader", memo, flock_id, custom_domain)
+
+@mcp.tool()
+def create_dns_token(memo: str, flock_id: Optional[str] = None) -> Dict:
+    """Create DNS token"""
+    return create_canarytoken("dns", memo, flock_id)
+
+@mcp.tool()
+def create_web_token(memo: str, flock_id: Optional[str] = None) -> Dict:
+    """Create Web/URL token"""
+    return create_canarytoken("web", memo, flock_id)
 
 @mcp.tool()
 def create_token_from_prompt(
     prompt: str,
-    flock_id: str = None,
-    custom_domain: str = None,
+    flock_id: Optional[str] = None,
+    custom_domain: Optional[str] = None,
     output_dir: str = "/mnt/user-data/outputs"
-) -> dict:
+) -> Dict:
     """
-    Create a Canarytoken based on a natural language prompt.
-    Automatically infers the token type and creates it.
-    For file-based tokens (Word, Excel, PDF), automatically downloads the file.
-    
-    Examples:
-    - "Create a Word document token for the HR folder called 'Salary Review 2024'"
-    - "Make a PDF token to detect document access"
-    - "Generate a DNS token for subdomain monitoring"
-    
-    Args:
-        prompt: Natural language description of the token to create
-        flock_id: Optional flock ID to assign the token to
-        custom_domain: Optional custom domain for the token
-        output_dir: Directory to save downloaded files (default: /mnt/user-data/outputs)
-    
-    Returns:
-        dict: Token creation result with download info for file-based tokens
+    Create Canarytoken from natural language.
+    Auto-downloads file-based tokens.
     """
-    _log("=" * 60)
-    _log("CREATE TOKEN FROM PROMPT: " + prompt)
+    _log(f"Create token from prompt: {prompt}")
     
     # Infer token kind
-    kind = _infer_token_kind(prompt)
-    _log("Inferred token kind: " + kind)
+    prompt_lower = prompt.lower()
+    kind_map = {
+        "doc-msword": ["word", "doc", "document", ".docx"],
+        "msexcel-macro": ["excel", "spreadsheet", ".xlsx", "xls"],
+        "pdf-acrobat-reader": ["pdf", ".pdf"],
+        "web": ["url", "web", "link", "http"],
+        "dns": ["dns", "domain"],
+        "smtp": ["email", "mail", "smtp"],
+        "aws-id": ["aws", "amazon", "s3"],
+        "qr-code": ["qr", "qr code"],
+        "clonedsite": ["cloned", "clone", "fake site"]
+    }
+    
+    kind = "doc-msword"  # default
+    for k, keywords in kind_map.items():
+        if any(word in prompt_lower for word in keywords):
+            kind = k
+            break
     
     # Extract memo
-    memo = _extract_memo(prompt)
-    _log("Extracted memo: " + memo)
+    quoted = re.findall(r'["\'](.+?)["\']', prompt)
+    if quoted:
+        memo = quoted[0]
+    else:
+        memo = re.sub(r'\b(create|make|generate|build|token|canarytoken)\b', '', prompt, flags=re.IGNORECASE).strip()
+        memo = memo[:97] + "..." if len(memo) > 100 else memo or "Canarytoken via MCP"
     
-    # Create the token
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": kind,
-        "memo": memo,
-    }
+    _log(f"Inferred: kind={kind}, memo={memo}")
     
-    if flock_id:
-        payload["flock_id"] = flock_id
-        _log("Using flock_id: " + flock_id)
+    response = create_canarytoken(kind, memo, flock_id, custom_domain)
     
-    if custom_domain:
-        payload["custom_domain"] = custom_domain
-        _log("Using custom_domain: " + custom_domain)
-    
-    result = _post_form("/api/v1/canarytoken/create", payload)
-    
-    if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Create failed: " + error_msg)
-        raise RuntimeError("Create failed: " + error_msg)
-    
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    
-    if not token_id:
-        _log("ERROR: No token_id in response")
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-    
-    _log("Token created successfully: " + token_id)
-    
-    response = {
-        "token_id": token_id,
-        "kind": kind,
-        "memo": memo,
-        "url": token_obj.get("url"),
-        "hostname": token_obj.get("hostname"),
-    }
-    
-    # For file-based tokens, automatically download
-    file_kinds = ["doc-msword", "msexcel-macro", "pdf-acrobat-reader"]
+    # Auto-download file-based tokens
+    file_kinds = {"doc-msword": ".docx", "msexcel-macro": ".xlsx", "pdf-acrobat-reader": ".pdf"}
     if kind in file_kinds:
-        _log("File-based token detected, downloading...")
         try:
-            extension_map = {
-                "doc-msword": ".docx",
-                "msexcel-macro": ".xlsx",
-                "pdf-acrobat-reader": ".pdf"
-            }
-            ext = extension_map.get(kind, ".file")
-            
-            filename = _safe_filename(memo) + ext
-            download_result = download_token_file(token_id, output_dir, filename)
+            filename = _safe_filename(memo) + file_kinds[kind]
+            download_result = download_token_file(response["token_id"], output_dir, filename)
             response["file_path"] = download_result["path"]
             response["file_size"] = download_result["size_bytes"]
-            _log("File downloaded to: " + download_result["path"])
         except Exception as e:
-            _log("WARNING: Failed to download file: " + str(e))
+            _log(f"WARNING: Download failed: {e}")
             response["download_error"] = str(e)
     
-    _log("=" * 60)
     return response
 
-
 @mcp.tool()
-def create_word_token(memo: str, flock_id: str = None, custom_domain: str = None) -> dict:
-    """
-    Create a Microsoft Word Canarytoken (kind=doc-msword).
-    
-    Args:
-        memo: Description/name for the token
-        flock_id: Optional flock ID
-        custom_domain: Optional custom domain
-    
-    Returns:
-        dict: Token creation result
-    """
-    _log("Creating Word token with memo: " + memo)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": "doc-msword",
-        "memo": memo,
-    }
-    if flock_id:
-        payload["flock_id"] = flock_id
-    if custom_domain:
-        payload["custom_domain"] = custom_domain
-
-    result = _post_form("/api/v1/canarytoken/create", payload)
-
-    if result.get("result") != "success":
-        raise RuntimeError("Create failed: " + (result.get("message") or json.dumps(result)))
-
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    if not token_id:
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-
-    _log("Word token created: " + token_id)
-    return {
-        "token_id": token_id,
-        "kind": token_obj.get("kind"),
-        "url": token_obj.get("url"),
-        "raw": result,
-    }
-
-
-@mcp.tool()
-def create_excel_token(memo: str, flock_id: str = None, custom_domain: str = None) -> dict:
-    """
-    Create a Microsoft Excel Canarytoken (kind=msexcel-macro).
-    
-    Args:
-        memo: Description/name for the token
-        flock_id: Optional flock ID
-        custom_domain: Optional custom domain
-    
-    Returns:
-        dict: Token creation result
-    """
-    _log("Creating Excel token with memo: " + memo)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": "msexcel-macro",
-        "memo": memo,
-    }
-    if flock_id:
-        payload["flock_id"] = flock_id
-    if custom_domain:
-        payload["custom_domain"] = custom_domain
-
-    result = _post_form("/api/v1/canarytoken/create", payload)
-
-    if result.get("result") != "success":
-        raise RuntimeError("Create failed: " + (result.get("message") or json.dumps(result)))
-
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    if not token_id:
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-
-    _log("Excel token created: " + token_id)
-    return {
-        "token_id": token_id,
-        "kind": token_obj.get("kind"),
-        "url": token_obj.get("url"),
-        "raw": result,
-    }
-
-
-@mcp.tool()
-def create_pdf_token(memo: str, flock_id: str = None, custom_domain: str = None) -> dict:
-    """
-    Create a PDF Canarytoken (kind=pdf-acrobat-reader).
-    
-    Args:
-        memo: Description/name for the token
-        flock_id: Optional flock ID
-        custom_domain: Optional custom domain
-    
-    Returns:
-        dict: Token creation result
-    """
-    _log("Creating PDF token with memo: " + memo)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": "pdf-acrobat-reader",
-        "memo": memo,
-    }
-    if flock_id:
-        payload["flock_id"] = flock_id
-    if custom_domain:
-        payload["custom_domain"] = custom_domain
-
-    result = _post_form("/api/v1/canarytoken/create", payload)
-
-    if result.get("result") != "success":
-        raise RuntimeError("Create failed: " + (result.get("message") or json.dumps(result)))
-
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    if not token_id:
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-
-    _log("PDF token created: " + token_id)
-    return {
-        "token_id": token_id,
-        "kind": token_obj.get("kind"),
-        "url": token_obj.get("url"),
-        "raw": result,
-    }
-
-
-@mcp.tool()
-def create_dns_token(memo: str, flock_id: str = None) -> dict:
-    """
-    Create a DNS Canarytoken (kind=dns).
-    
-    Args:
-        memo: Description/name for the token
-        flock_id: Optional flock ID
-    
-    Returns:
-        dict: Token creation result with hostname
-    """
-    _log("Creating DNS token with memo: " + memo)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": "dns",
-        "memo": memo,
-    }
-    if flock_id:
-        payload["flock_id"] = flock_id
-
-    result = _post_form("/api/v1/canarytoken/create", payload)
-
-    if result.get("result") != "success":
-        raise RuntimeError("Create failed: " + (result.get("message") or json.dumps(result)))
-
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    if not token_id:
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-
-    _log("DNS token created: " + token_id)
-    return {
-        "token_id": token_id,
-        "kind": token_obj.get("kind"),
-        "hostname": token_obj.get("hostname"),
-        "raw": result,
-    }
-
-
-@mcp.tool()
-def create_web_token(memo: str, flock_id: str = None) -> dict:
-    """
-    Create a Web/URL Canarytoken (kind=web).
-    
-    Args:
-        memo: Description/name for the token
-        flock_id: Optional flock ID
-    
-    Returns:
-        dict: Token creation result with URL
-    """
-    _log("Creating Web token with memo: " + memo)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "kind": "web",
-        "memo": memo,
-    }
-    if flock_id:
-        payload["flock_id"] = flock_id
-
-    result = _post_form("/api/v1/canarytoken/create", payload)
-
-    if result.get("result") != "success":
-        raise RuntimeError("Create failed: " + (result.get("message") or json.dumps(result)))
-
-    token_obj = result.get("canarytoken") or {}
-    token_id = token_obj.get("canarytoken")
-    if not token_id:
-        raise RuntimeError("Create succeeded but no token id returned: " + json.dumps(result))
-
-    _log("Web token created: " + token_id)
-    return {
-        "token_id": token_id,
-        "kind": token_obj.get("kind"),
-        "url": token_obj.get("url"),
-        "raw": result,
-    }
-
-
-@mcp.tool()
-def download_token_file(token_id: str, output_dir: str, filename_hint: str = None) -> dict:
-    """
-    Download the generated file for a token (Word doc, Excel, PDF, etc.) and save it locally.
-    
-    Args:
-        token_id: The token ID to download
-        output_dir: Directory to save the file
-        filename_hint: Optional filename (will be sanitized)
-    
-    Returns:
-        dict: Download result with file path and size
-    """
-    _log("=" * 60)
-    _log("DOWNLOADING TOKEN FILE: " + token_id)
-    _log("=" * 60)
+def download_token_file(token_id: str, output_dir: str, filename_hint: Optional[str] = None) -> Dict:
+    """Download token file (Word, Excel, PDF, etc.)"""
+    _log(f"Downloading token file: {token_id}")
     
     b = _get_bytes("/api/v1/canarytoken/download", {
         "auth_token": _auth_token(),
-        "canarytoken": token_id,
+        "canarytoken": token_id
     })
-
+    
     out_dir = pathlib.Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    base = filename_hint or ("canarytoken_" + token_id + ".docx")
+    
+    base = filename_hint or f"canarytoken_{token_id}.docx"
     base = _safe_filename(base)
     if not base.lower().endswith((".docx", ".xlsx", ".pdf")):
-        base = base + ".docx"
-
+        base += ".docx"
+    
     out_path = out_dir / base
     out_path.write_bytes(b)
-
-    _log("File saved to: " + str(out_path))
+    
+    _log(f"File saved: {out_path}")
     return {"token_id": token_id, "path": str(out_path), "size_bytes": len(b)}
 
-
 @mcp.tool()
-def set_token_enabled(token_id: str, enabled: bool) -> dict:
-    """
-    Enable or disable a Canarytoken.
-    
-    Args:
-        token_id: The token ID
-        enabled: True to enable, False to disable
-    
-    Returns:
-        dict: Result of the operation
-    """
-    action = "enable" if enabled else "disable"
-    _log("Setting token " + token_id + " to " + action)
-    
+def set_token_enabled(token_id: str, enabled: bool) -> Dict:
+    """Enable or disable a Canarytoken"""
     endpoint = "/api/v1/canarytoken/enable" if enabled else "/api/v1/canarytoken/disable"
-    result = _post_form(endpoint, {
+    result = _api_call("POST", endpoint, data={
         "auth_token": _auth_token(),
-        "canarytoken": token_id,
+        "canarytoken": token_id
     })
-
+    
     if result.get("result") != "success":
-        raise RuntimeError("Enable/disable failed: " + (result.get("message") or json.dumps(result)))
-
+        raise RuntimeError(f"Enable/disable failed: {result.get('message', result)}")
+    
     return {"token_id": token_id, "enabled": enabled, "raw": result}
 
-
 @mcp.tool()
-def delete_canarytoken(token_id: str) -> dict:
-    """
-    Delete a Canarytoken.
+def delete_canarytoken(token_id: str) -> Dict:
+    """Delete a Canarytoken"""
+    _log(f"Deleting token: {token_id}")
     
-    Args:
-        token_id: The token ID to delete
-    
-    Returns:
-        dict: Result of the deletion
-    """
-    _log("Deleting canarytoken: " + token_id)
-    
-    result = _post_form("/api/v1/canarytoken/delete", {
+    result = _api_call("POST", "/api/v1/canarytoken/delete", data={
         "auth_token": _auth_token(),
-        "canarytoken": token_id,
+        "canarytoken": token_id
     })
-
+    
     if result.get("result") != "success":
-        raise RuntimeError("Delete failed: " + (result.get("message") or json.dumps(result)))
-
-    _log("Token deleted successfully")
+        raise RuntimeError(f"Delete failed: {result.get('message', result)}")
+    
     return {"token_id": token_id, "status": "deleted", "raw": result}
 
-
 @mcp.tool()
-def list_token_types() -> dict:
-    """
-    List all supported Canarytoken types that can be created.
-    """
+def list_token_types() -> Dict:
+    """List supported Canarytoken types"""
     return {
         "supported_types": {
             "doc-msword": "Microsoft Word document",
@@ -1068,254 +624,112 @@ def list_token_types() -> dict:
             "qr-code": "QR code",
             "clonedsite": "Cloned website"
         },
-        "usage": "Use natural language prompts like 'Create a Word token' or 'Make a PDF for contract monitoring'"
+        "usage": "Use create_canarytoken(kind, memo) or natural language with create_token_from_prompt()"
     }
 
-
 # ============================================================================
-# CANARYTOKEN FACTORY TOOLS
+# FACTORY MANAGEMENT
 # ============================================================================
 
 @mcp.tool()
-def list_factory_token_types() -> dict:
-    """
-    List all Canarytoken types available via the factory.
-    Factory tokens allow bulk creation and download of multiple tokens at once.
-    
-    Returns:
-        dict: Available factory token types
-    """
-    _log("=" * 60)
-    _log("LISTING FACTORY TOKEN TYPES")
-    _log("=" * 60)
-    
-    result = _get_json("/api/v1/canarytokens/factory/list", {
-        "auth_token": _auth_token()
-    })
-    
+def list_factory_token_types() -> Dict:
+    """List factory-available token types"""
+    result = _api_call("GET", "/api/v1/canarytokens/factory/list", params={"auth_token": _auth_token()})
     if result.get("result") != "success":
-        raise RuntimeError("List factory types failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"List factory types failed: {result.get('message', result)}")
     
     factory_types = result.get("factory_canarytokens", {})
-    _log("Found " + str(len(factory_types)) + " factory token types")
-    
-    return {
-        "count": len(factory_types),
-        "factory_types": factory_types,
-        "raw_response": result
-    }
-
+    return {"count": len(factory_types), "factory_types": factory_types, "raw_response": result}
 
 @mcp.tool()
 def create_token_factory(
     factory_auth: str,
-    flock_id: str = None,
-    memo: str = None,
-    kind: str = None
-) -> dict:
-    """
-    Create a new Canarytoken factory for bulk token generation.
+    flock_id: Optional[str] = None,
+    memo: Optional[str] = None,
+    kind: Optional[str] = None
+) -> Dict:
+    """Create token factory for bulk generation"""
+    _log(f"Creating factory: {factory_auth}")
     
-    Args:
-        factory_auth: Authentication string for the factory (acts as password)
-        flock_id: Optional flock ID to assign created tokens to
-        memo: Optional memo for the factory
-        kind: Optional token kind to restrict factory to (e.g., 'doc-msword', 'pdf-acrobat-reader')
-    
-    Returns:
-        dict: Factory creation result with factory_auth token
-    """
-    _log("=" * 60)
-    _log("CREATING TOKEN FACTORY")
-    _log("=" * 60)
-    
-    payload = {
-        "auth_token": _auth_token(),
-        "factory_auth": factory_auth
-    }
-    
+    data = {"auth_token": _auth_token(), "factory_auth": factory_auth}
     if flock_id:
-        payload["flock_id"] = flock_id
-        _log("Flock ID: " + flock_id)
-    
+        data["flock_id"] = flock_id
     if memo:
-        payload["memo"] = memo
-        _log("Memo: " + memo)
-    
+        data["memo"] = memo
     if kind:
-        payload["kind"] = kind
-        _log("Kind: " + kind)
+        data["kind"] = kind
     
-    result = _post_form("/api/v1/canarytoken/create_factory", payload)
-    
+    result = _api_call("POST", "/api/v1/canarytoken/create_factory", data=data)
     if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Create factory failed: " + error_msg)
-        raise RuntimeError("Create factory failed: " + error_msg)
+        raise RuntimeError(f"Create factory failed: {result.get('message', result)}")
     
-    factory = result.get("factory", {})
-    _log("Factory created successfully")
-    _log("Factory auth: " + factory_auth)
-    _log("=" * 60)
-    
-    return {
-        "factory_auth": factory_auth,
-        "factory": factory,
-        "raw_response": result
-    }
-
+    return {"factory_auth": factory_auth, "factory": result.get("factory", {}), "raw_response": result}
 
 @mcp.tool()
-def list_token_factories() -> dict:
-    """
-    List all existing Canarytoken factories.
-    
-    Returns:
-        dict: List of factories with their details
-    """
-    _log("=" * 60)
-    _log("LISTING TOKEN FACTORIES")
-    _log("=" * 60)
-    
-    result = _get_json("/api/v1/canarytoken/list_factories", {
-        "auth_token": _auth_token()
-    })
-    
+def list_token_factories() -> Dict:
+    """List all token factories"""
+    result = _api_call("GET", "/api/v1/canarytoken/list_factories", params={"auth_token": _auth_token()})
     if result.get("result") != "success":
-        raise RuntimeError("List factories failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"List factories failed: {result.get('message', result)}")
     
     factories = result.get("factories", [])
-    _log("Found " + str(len(factories)) + " factories")
+    factory_list = [{
+        "factory_auth": f.get("factory_auth"),
+        "memo": f.get("memo"),
+        "kind": f.get("kind"),
+        "flock_id": f.get("flock_id"),
+        "created": f.get("created"),
+        "created_printable": f.get("created_printable")
+    } for f in factories]
     
-    factory_list = []
-    for factory in factories:
-        factory_info = {
-            "factory_auth": factory.get("factory_auth"),
-            "memo": factory.get("memo"),
-            "kind": factory.get("kind"),
-            "flock_id": factory.get("flock_id"),
-            "created": factory.get("created"),
-            "created_printable": factory.get("created_printable")
-        }
-        factory_list.append(factory_info)
-        _log("  Factory: " + str(factory_info["factory_auth"]) + " (Kind: " + str(factory_info["kind"]) + ")")
-    
-    return {
-        "count": len(factory_list),
-        "factories": factory_list,
-        "raw_response": result
-    }
-
+    return {"count": len(factory_list), "factories": factory_list, "raw_response": result}
 
 @mcp.tool()
-def delete_token_factory(factory_auth: str) -> dict:
-    """
-    Delete a Canarytoken factory.
-    
-    Args:
-        factory_auth: The factory authentication string
-    
-    Returns:
-        dict: Deletion result
-    """
-    _log("Deleting token factory: " + factory_auth)
-    
-    result = _post_form("/api/v1/canarytoken/delete_factory", {
+def delete_token_factory(factory_auth: str) -> Dict:
+    """Delete a token factory"""
+    result = _api_call("POST", "/api/v1/canarytoken/delete_factory", data={
         "auth_token": _auth_token(),
         "factory_auth": factory_auth
     })
     
     if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Delete factory failed: " + error_msg)
-        raise RuntimeError("Delete factory failed: " + error_msg)
+        raise RuntimeError(f"Delete factory failed: {result.get('message', result)}")
     
-    _log("Factory deleted successfully")
-    return {
-        "factory_auth": factory_auth,
-        "status": "deleted",
-        "raw_response": result
-    }
-
+    return {"factory_auth": factory_auth, "status": "deleted", "raw_response": result}
 
 @mcp.tool()
 def create_tokens_from_factory(
     factory_auth: str,
     count: int = 1,
-    memo: str = None,
-    kind: str = None
-) -> dict:
-    """
-    Create multiple tokens from a factory.
+    memo: Optional[str] = None,
+    kind: Optional[str] = None
+) -> Dict:
+    """Create multiple tokens from factory"""
+    _log(f"Creating {count} tokens from factory")
     
-    Args:
-        factory_auth: The factory authentication string
-        count: Number of tokens to create (default 1)
-        memo: Optional memo for the tokens
-        kind: Optional token kind (if not set by factory)
-    
-    Returns:
-        dict: Creation result with token IDs
-    """
-    _log("=" * 60)
-    _log("CREATING TOKENS FROM FACTORY")
-    _log("Factory auth: " + factory_auth)
-    _log("Count: " + str(count))
-    _log("=" * 60)
-    
-    payload = {
-        "factory_auth": factory_auth
-    }
-    
+    data = {"factory_auth": factory_auth}
     if count:
-        payload["count"] = str(count)
-    
+        data["count"] = str(count)
     if memo:
-        payload["memo"] = memo
-    
+        data["memo"] = memo
     if kind:
-        payload["kind"] = kind
+        data["kind"] = kind
     
-    result = _post_form("/api/v1/canarytoken/factory/create", payload)
-    
+    result = _api_call("POST", "/api/v1/canarytoken/factory/create", data=data)
     if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Create tokens failed: " + error_msg)
-        raise RuntimeError("Create tokens failed: " + error_msg)
+        raise RuntimeError(f"Create tokens failed: {result.get('message', result)}")
     
     tokens = result.get("tokens", [])
-    _log("Created " + str(len(tokens)) + " tokens successfully")
-    
-    return {
-        "factory_auth": factory_auth,
-        "count": len(tokens),
-        "tokens": tokens,
-        "raw_response": result
-    }
-
+    return {"factory_auth": factory_auth, "count": len(tokens), "tokens": tokens, "raw_response": result}
 
 @mcp.tool()
 def download_factory_tokens(
     factory_auth: str,
     output_dir: str = "/mnt/user-data/outputs",
-    filename: str = None
-) -> dict:
-    """
-    Download all tokens from a factory as a ZIP file.
-    Useful for downloading multiple token files at once.
-    
-    Args:
-        factory_auth: The factory authentication string
-        output_dir: Directory to save the ZIP file (default: /mnt/user-data/outputs)
-        filename: Optional filename for the ZIP (default: factory_tokens_FACTORY_AUTH.zip)
-    
-    Returns:
-        dict: Download result with file path and size
-    """
-    _log("=" * 60)
-    _log("DOWNLOADING FACTORY TOKENS")
-    _log("Factory auth: " + factory_auth)
-    _log("=" * 60)
+    filename: Optional[str] = None
+) -> Dict:
+    """Download factory tokens as ZIP"""
+    _log(f"Downloading factory tokens: {factory_auth}")
     
     b = _get_bytes("/api/v1/canarytoken/factory/download", {
         "auth_token": _auth_token(),
@@ -1325,512 +739,129 @@ def download_factory_tokens(
     out_dir = pathlib.Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    if not filename:
-        filename = "factory_tokens_" + factory_auth[:8] + ".zip"
-    
+    filename = filename or f"factory_tokens_{factory_auth[:8]}.zip"
     filename = _safe_filename(filename)
     if not filename.lower().endswith(".zip"):
-        filename = filename + ".zip"
+        filename += ".zip"
     
     out_path = out_dir / filename
     out_path.write_bytes(b)
     
-    _log("ZIP file saved to: " + str(out_path))
-    _log("Size: " + str(len(b)) + " bytes")
-    _log("=" * 60)
-    
-    return {
-        "factory_auth": factory_auth,
-        "path": str(out_path),
-        "size_bytes": len(b),
-        "filename": filename
-    }
-
+    _log(f"ZIP saved: {out_path} ({len(b)} bytes)")
+    return {"factory_auth": factory_auth, "path": str(out_path), "size_bytes": len(b), "filename": filename}
 
 # ============================================================================
-# INCIDENT MANAGEMENT TOOLS
+# INCIDENT MANAGEMENT
 # ============================================================================
 
 @mcp.tool()
 def list_incidents(
-    incidents_since: str = None,
+    incidents_since: Optional[str] = None,
     limit: int = 100,
-    node_id: str = None,
-    flock_id: str = None
-) -> dict:
-    """
-    List incidents/alerts from Canary devices and tokens.
-    
-    Args:
-        incidents_since: Optional timestamp to filter incidents (Unix timestamp or ISO format)
-        limit: Maximum number of incidents to return (default 100, max 1000)
-        node_id: Optional device ID to filter incidents
-        flock_id: Optional flock ID to filter incidents
-    
-    Returns:
-        dict: List of incidents with details
-    """
-    _log("=" * 60)
+    node_id: Optional[str] = None,
+    flock_id: Optional[str] = None
+) -> Dict:
+    """List incidents/alerts"""
     _log("LISTING INCIDENTS")
-    _log("=" * 60)
     
-    params = {
-        "auth_token": _auth_token()
-    }
-    
+    params = {"auth_token": _auth_token()}
     if incidents_since:
         params["incidents_since"] = incidents_since
-        _log("Filtering incidents since: " + incidents_since)
-    
     if limit:
         params["limit"] = str(limit)
-    
     if node_id:
         params["node_id"] = node_id
-        _log("Filtering by node_id: " + node_id)
-    
     if flock_id:
         params["flock_id"] = flock_id
-        _log("Filtering by flock_id: " + flock_id)
     
-    result = _get_json("/api/v1/incidents/all", params)
-    
+    result = _api_call("GET", "/api/v1/incidents/all", params=params)
     if result.get("result") != "success":
-        raise RuntimeError("List incidents failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"List incidents failed: {result.get('message', result)}")
     
     incidents = result.get("incidents", [])
-    _log("Found " + str(len(incidents)) + " incidents")
+    incident_list = [{
+        "id": i.get("id"),
+        "summary": i.get("summary"),
+        "description": i.get("description"),
+        "created": i.get("created"),
+        "created_printable": i.get("created_printable"),
+        "updated": i.get("updated"),
+        "updated_printable": i.get("updated_printable"),
+        "node_id": i.get("node_id"),
+        "device_name": i.get("device", {}).get("name"),
+        "src_host": i.get("src_host"),
+        "dst_port": i.get("dst_port"),
+        "logtype": i.get("logtype")
+    } for i in incidents]
     
-    incident_list = []
-    for incident in incidents:
-        incident_info = {
-            "id": incident.get("id"),
-            "summary": incident.get("summary"),
-            "description": incident.get("description"),
-            "created": incident.get("created"),
-            "created_printable": incident.get("created_printable"),
-            "updated": incident.get("updated"),
-            "updated_printable": incident.get("updated_printable"),
-            "node_id": incident.get("node_id"),
-            "device_name": incident.get("device", {}).get("name"),
-            "src_host": incident.get("src_host"),
-            "dst_port": incident.get("dst_port"),
-            "logtype": incident.get("logtype")
-        }
-        incident_list.append(incident_info)
-    
-    return {
-        "count": len(incident_list),
-        "incidents": incident_list,
-        "raw_response": result
-    }
-
+    return {"count": len(incident_list), "incidents": incident_list, "raw_response": result}
 
 @mcp.tool()
-def get_incident_details(incident_id: str) -> dict:
-    """
-    Get detailed information about a specific incident.
-    
-    Args:
-        incident_id: The incident ID
-    
-    Returns:
-        dict: Detailed incident information
-    """
-    _log("Getting details for incident: " + incident_id)
-    
-    result = _get_json("/api/v1/incident/get", {
+def get_incident_details(incident_id: str) -> Dict:
+    """Get detailed incident information"""
+    result = _api_call("GET", "/api/v1/incident/get", params={
         "auth_token": _auth_token(),
         "incident": incident_id
     })
     
     if result.get("result") != "success":
-        raise RuntimeError("Get incident details failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Get incident failed: {result.get('message', result)}")
     
-    return {
-        "incident_id": incident_id,
-        "incident": result.get("incident", {}),
-        "raw_response": result
-    }
-
+    return {"incident_id": incident_id, "incident": result.get("incident", {}), "raw_response": result}
 
 @mcp.tool()
-def acknowledge_incident(incident_id: str) -> dict:
-    """
-    Acknowledge an incident.
-    
-    Args:
-        incident_id: The incident ID to acknowledge
-    
-    Returns:
-        dict: Acknowledgement result
-    """
-    _log("Acknowledging incident: " + incident_id)
-    
-    result = _post_form("/api/v1/incident/acknowledge", {
+def acknowledge_incident(incident_id: str) -> Dict:
+    """Acknowledge an incident"""
+    result = _api_call("POST", "/api/v1/incident/acknowledge", data={
         "auth_token": _auth_token(),
         "incident": incident_id
     })
     
     if result.get("result") != "success":
-        raise RuntimeError("Acknowledge incident failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Acknowledge failed: {result.get('message', result)}")
     
-    _log("Incident acknowledged successfully")
-    return {
-        "incident_id": incident_id,
-        "status": "acknowledged",
-        "raw_response": result
-    }
-
+    return {"incident_id": incident_id, "status": "acknowledged", "raw_response": result}
 
 @mcp.tool()
-def unacknowledge_incident(incident_id: str) -> dict:
-    """
-    Unacknowledge an incident.
-    
-    Args:
-        incident_id: The incident ID to unacknowledge
-    
-    Returns:
-        dict: Unacknowledgement result
-    """
-    _log("Unacknowledging incident: " + incident_id)
-    
-    result = _post_form("/api/v1/incident/unacknowledge", {
+def unacknowledge_incident(incident_id: str) -> Dict:
+    """Unacknowledge an incident"""
+    result = _api_call("POST", "/api/v1/incident/unacknowledge", data={
         "auth_token": _auth_token(),
         "incident": incident_id
     })
     
     if result.get("result") != "success":
-        raise RuntimeError("Unacknowledge incident failed: " + (result.get("message") or json.dumps(result)))
+        raise RuntimeError(f"Unacknowledge failed: {result.get('message', result)}")
     
-    _log("Incident unacknowledged successfully")
-    return {
-        "incident_id": incident_id,
-        "status": "unacknowledged",
-        "raw_response": result
-    }
-
-
-# ============================================================================
-# DEVICE SETTINGS MANAGEMENT TOOLS (ENHANCED)
-# ============================================================================
-
-@mcp.tool()
-def get_device_settings(device_id: str = None, device_name: str = None) -> dict:
-    """
-    Retrieve all configuration settings for a specific Canary device.
-    
-    Args:
-        device_id: The node_id of the device
-        device_name: The name of the device (alternative to device_id)
-    
-    Returns:
-        dict: Complete settings object for the device
-    """
-    if not device_id and not device_name:
-        raise RuntimeError("Must specify either device_id or device_name")
-    
-    # If only name provided, look up the ID
-    if not device_id:
-        devices_result = list_devices()
-        for device in devices_result["devices"]:
-            if device["name"] and device_name.lower() in device["name"].lower():
-                device_id = device["id"]
-                break
-        
-        if not device_id:
-            raise RuntimeError("Device '" + device_name + "' not found")
-    
-    _log("=" * 60)
-    _log("GETTING DEVICE SETTINGS FOR: " + device_id)
-    _log("=" * 60)
-    
-    result = _get_json("/api/v1/device/info", {
-        "auth_token": _auth_token(),
-        "node_id": device_id,
-        "settings": "true"
-    })
-    
-    if result.get("result") != "success":
-        raise RuntimeError("Get device settings failed: " + (result.get("message") or json.dumps(result)))
-    
-    device = result.get("device", {})
-    settings = device.get("settings", {})
-    
-    _log("Retrieved settings with " + str(len(settings)) + " keys")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "device_name": device.get("name"),
-        "settings": settings,
-        "update_tag": device.get("update_tag")
-    }
-
-
-@mcp.tool()
-def update_device_settings(device_id: str, settings: dict) -> dict:
-    """
-    Update configuration settings for a specific Canary device.
-    
-    Use get_device_settings first to retrieve the current settings object, modify it as needed, then submit the updated object.
-    
-    Common settings to modify:
-        device.name - Device name (e.g., 'SecOps-04')
-        device.desc - Device description
-        device.personality - Device personality (windows, linux, network, osx-fileshare, bare, etc)
-        device.ip_address - IP address
-        device.netmask - Network mask
-        device.gw - Gateway
-        device.dns1 / device.dns2 - DNS servers
-        smb.enabled - Enable/disable SMB service
-        ssh.instances[0].enabled - Enable/disable SSH
-        http.instances[0].enabled - Enable/disable HTTP
-        And many more service-specific settings
-    
-    Args:
-        device_id: The node_id of the device to update
-        settings: The modified settings object (dict)
-    
-    Returns:
-        dict: Update result confirmation
-    """
-    _log("=" * 60)
-    _log("UPDATING DEVICE SETTINGS FOR: " + device_id)
-    _log("=" * 60)
-    
-    # First get the current device info to obtain update_tag
-    _log("Fetching current device info to get update_tag...")
-    device_info_result = _get_json("/api/v1/device/info", {
-        "auth_token": _auth_token(),
-        "node_id": device_id,
-        "settings": "true"
-    })
-    
-    if device_info_result.get("result") != "success":
-        raise RuntimeError("Failed to get device info: " + (device_info_result.get("message") or json.dumps(device_info_result)))
-    
-    device = device_info_result.get("device", {})
-    update_tag = device.get("update_tag")
-    
-    if not update_tag:
-        raise RuntimeError("Could not retrieve update_tag from device info")
-    
-    _log("Got update_tag: " + update_tag)
-    
-    # Build the payload with all settings
-    payload = {
-        "auth_token": _auth_token(),
-        "node_id": device_id,
-        "update_tag": update_tag
-    }
-    
-    # Flatten settings dict into form data (device.name=value format)
-    _log("Flattening " + str(len(settings)) + " settings into payload...")
-    
-    def flatten_dict(d, parent_key=''):
-        items = []
-        for k, v in d.items():
-            new_key = parent_key + '.' + k if parent_key else k
-            if isinstance(v, dict):
-                items.extend(flatten_dict(v, new_key).items())
-            elif isinstance(v, list):
-                # Handle lists - convert to JSON string
-                items.append((new_key, json.dumps(v)))
-            else:
-                items.append((new_key, _format_setting_value(v)))
-        return dict(items)
-    
-    flattened_settings = flatten_dict(settings)
-    payload.update(flattened_settings)
-    
-    _log("Payload has " + str(len(payload)) + " keys total")
-    
-    # Submit updated settings
-    result = _post_form("/api/v1/device/update", payload)
-    
-    if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Settings update failed: " + error_msg)
-        raise RuntimeError("Settings update failed: " + error_msg)
-    
-    _log("Device settings updated successfully!")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "status": "success",
-        "settings_updated": len(flattened_settings),
-        "raw_response": result
-    }
-
-
-@mcp.tool()
-def update_device_setting(device_id: str, setting_key: str, value) -> dict:
-    """
-    Convenience function to update a single device setting without needing to provide the full settings object.
-    
-    This function sends the setting directly to the API using dot notation, which allows you to change any 
-    device configuration property according to the Canary API documentation.
-    
-    Common examples:
-        - Update name: update_device_setting(device_id, 'device.name', 'SecOps-04')
-        - Update description: update_device_setting(device_id, 'device.desc', 'Production Honeypot')
-        - Enable SSH: update_device_setting(device_id, 'ssh.instances.0.enabled', True)
-        - Disable SMB: update_device_setting(device_id, 'smb.enabled', False)
-        - Update IP: update_device_setting(device_id, 'device.ip_address', '192.168.1.100')
-        - Set HTTP banner: update_device_setting(device_id, 'http.instances.0.banner', 'Apache/2.4.41')
-        - Enable FTP: update_device_setting(device_id, 'ftp.enabled', True)
-        - Set device location: update_device_setting(device_id, 'device.location', 'Server Room A')
-    
-    Args:
-        device_id: The node_id of the device
-        setting_key: Dot-notation path to the setting (e.g., 'device.name' or 'ssh.instances.0.enabled')
-        value: The new value (string, int, bool, list, or dict)
-    
-    Returns:
-        dict: Update result confirmation
-    """
-    _log("=" * 60)
-    _log("UPDATING SINGLE DEVICE SETTING")
-    _log("Device ID: " + device_id)
-    _log("Setting: " + setting_key)
-    _log("Value: " + str(value))
-    _log("=" * 60)
-    
-    # Get update_tag from current device info
-    _log("Fetching current device info to get update_tag...")
-    device_info_result = _get_json("/api/v1/device/info", {
-        "auth_token": _auth_token(),
-        "node_id": device_id
-    })
-    
-    if device_info_result.get("result") != "success":
-        raise RuntimeError("Failed to get device info: " + (device_info_result.get("message") or json.dumps(device_info_result)))
-    
-    device = device_info_result.get("device", {})
-    update_tag = device.get("update_tag")
-    
-    if not update_tag:
-        raise RuntimeError("Could not retrieve update_tag from device info")
-    
-    _log("Got update_tag: " + update_tag)
-    
-    # Build payload with the single setting
-    payload = {
-        "auth_token": _auth_token(),
-        "node_id": device_id,
-        "update_tag": update_tag,
-        setting_key: _format_setting_value(value)
-    }
-    
-    _log("Sending update with setting: " + setting_key + " = " + str(payload[setting_key]))
-    
-    # Submit update
-    result = _post_form("/api/v1/device/update", payload)
-    
-    if result.get("result") != "success":
-        error_msg = result.get("message") or json.dumps(result)
-        _log("ERROR: Setting update failed: " + error_msg)
-        raise RuntimeError("Setting update failed: " + error_msg)
-    
-    _log("Device setting updated successfully!")
-    _log("=" * 60)
-    
-    return {
-        "device_id": device_id,
-        "setting_key": setting_key,
-        "value": value,
-        "status": "success",
-        "raw_response": result
-    }
-
+    return {"incident_id": incident_id, "status": "unacknowledged", "raw_response": result}
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main() -> None:
-    """
-    Run the MCP server in stdio mode.
-    IMPORTANT: Don't print to stdout - it will corrupt JSON-RPC. Use stderr for logs.
-    """
+    """Run MCP server in stdio mode"""
     _log("=" * 60)
-    _log("Starting Canary Console MCP Server (ENHANCED VERSION)")
+    _log("Canary Console MCP Server - Enhanced & Efficient")
     _log("=" * 60)
-    _log("Environment check:")
     
     try:
         domain = os.environ.get("CANARY_DOMAIN", "")
         token = os.environ.get("CANARY_AUTH_TOKEN", "")
-        
-        if domain:
-            _log("  CANARY_DOMAIN: " + domain)
-        else:
-            _log("  CANARY_DOMAIN: NOT SET")
-            
-        if token:
-            _log("  CANARY_AUTH_TOKEN: SET (length: " + str(len(token)) + ")")
-        else:
-            _log("  CANARY_AUTH_TOKEN: NOT SET")
-            
+        _log(f"CANARY_DOMAIN: {domain or 'NOT SET'}")
+        _log(f"CANARY_AUTH_TOKEN: {'SET' if token else 'NOT SET'} ({len(token)} chars)")
     except Exception as e:
-        _log("Environment check error: " + str(e))
+        _log(f"Environment check error: {e}")
     
     _log("=" * 60)
-    _log("Available Tools:")
-    _log("  DEVICES:")
-    _log("    - list_devices() - List all Canary devices")
-    _log("    - get_device_info() - Get detailed device information")
-    _log("    - configure_device_personality() - Set device personality")
-    _log("    - update_device_description() - Update device description")
-    _log("    - configure_device_from_prompt() - Natural language configuration")
-    _log("    - reboot_device() - Reboot a device")
-    _log("    - get_device_settings() - Get all device configuration settings")
-    _log("    - update_device_settings() - Update full device settings object")
-    _log("    - update_device_setting() - Update a single device setting (ENHANCED)")
-    _log("  FLOCKS:")
-    _log("    - list_flocks() - List all flocks (device groups)")
-    _log("  TOKENS:")
-    _log("    - list_canarytokens() - List all Canarytokens")
-    _log("    - get_canarytokens_summary() - Get token summary by type")
-    _log("    - create_token_from_prompt() - Create token from natural language")
-    _log("    - create_word_token() - Create Word document token")
-    _log("    - create_excel_token() - Create Excel spreadsheet token")
-    _log("    - create_pdf_token() - Create PDF document token")
-    _log("    - create_dns_token() - Create DNS token")
-    _log("    - create_web_token() - Create Web URL token")
-    _log("    - download_token_file() - Download token file")
-    _log("    - set_token_enabled() - Enable/disable a token")
-    _log("    - delete_canarytoken() - Delete a token")
-    _log("    - list_token_types() - List supported token types")
-    _log("  FACTORY:")
-    _log("    - list_factory_token_types() - List factory token types")
-    _log("    - create_token_factory() - Create token factory")
-    _log("    - list_token_factories() - List all factories")
-    _log("    - delete_token_factory() - Delete a factory")
-    _log("    - create_tokens_from_factory() - Create tokens from factory")
-    _log("    - download_factory_tokens() - Download factory tokens as ZIP")
-    _log("  INCIDENTS:")
-    _log("    - list_incidents() - List all incidents/alerts")
-    _log("    - get_incident_details() - Get detailed incident information")
-    _log("    - acknowledge_incident() - Acknowledge an incident")
-    _log("    - unacknowledge_incident() - Unacknowledge an incident")
-    _log("=" * 60)
-    _log("ENHANCED: update_device_setting() now supports ANY device configuration property")
-    _log("          according to Canary API documentation using dot notation")
-    _log("=" * 60)
-    _log("Server ready for connections")
+    _log("Server ready - awaiting connections")
     _log("=" * 60)
     
     mcp.run()
-
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        _log("FATAL ERROR: " + str(e))
-        print(str(e), file=sys.stderr)
+        _log(f"FATAL ERROR: {e}")
         raise
